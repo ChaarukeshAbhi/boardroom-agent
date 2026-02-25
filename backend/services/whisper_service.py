@@ -35,19 +35,20 @@ def transcribe_audio(audio_path: str):
 def transcribe_with_segments(audio_path: str):
     """
     High-accuracy transcription for full meeting recordings.
-    Uses a larger model and beam search for better accuracy.
+    Uses a larger model plus Whisper's default sampling + safety thresholds
+    to reduce repetitions and hallucinations.
     Returns the raw Whisper result (with "segments", "language", etc.).
     """
     m = _get_transcription_model()
-    beam_size = getattr(settings, "WHISPER_BEAM_SIZE", 5)
-    best_of = getattr(settings, "WHISPER_BEST_OF", 5)
 
     result = m.transcribe(
         audio_path,
         language=None,
         fp16=False,
-        beam_size=beam_size,
-        best_of=best_of,
-        condition_on_previous_text=True,
+        # Temperature fallback & thresholds are robust against repetition
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8),
+        compression_ratio_threshold=2.4,
+        logprob_threshold=-1.0,
+        no_speech_threshold=0.6,
     )
     return result

@@ -153,11 +153,15 @@ async def get_transcript(bot_id: str):
                 resp = requests.get(participants_url)
                 if resp.ok:
                     participants = resp.json()
-                    # Expect a list of participants with id + name
+                    print(f"👥 Participants: {participants}")
+                    # Expect a list of participants with id + name/email
                     for p in participants:
                         pid = p.get("id")
-                        if pid is not None:
-                            participants_by_id[pid] = p.get("name") or f"Speaker {pid}"
+                        if pid is None:
+                            continue
+                        name = p.get("name") or p.get("email")
+                        if name:
+                            participants_by_id[pid] = name
                 else:
                     print(f"⚠️ Failed to fetch participants: {resp.status_code}")
 
@@ -296,7 +300,12 @@ async def get_transcript(bot_id: str):
                 and current["speaker"] == speaker_label
                 and start_time - current["end"] <= 2.0  # seconds gap threshold
             ):
-                current["text"] += (" " if current["text"] else "") + text
+                # Avoid obvious duplicated text (Whisper can sometimes repeat phrases)
+                combined = (current["text"] + " " + text).strip()
+                # If new text is almost fully contained at the end, skip appending
+                tail = current["text"][-len(text) - 5 :] if len(current["text"]) > len(text) + 5 else current["text"]
+                if text not in tail:
+                    current["text"] = combined
                 current["end"] = end_time
             else:
                 if current:
