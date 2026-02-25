@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #312e81 100%);
+  color: white;
+}
+
+.gradient-bg {
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #312e81 100%);
+}
+
+.gradient-bottom {
+  background: linear-gradient(90deg, #7c3aed 0%, #a855f7 100%);
+}
+
+.btn-transparent {
+  @apply px-6 py-2 border border-cyan-400 rounded-full text-white hover:bg-cyan-400 hover:bg-opacity-10 transition-all;
+}
+
+.btn-transparent-lg {
+  @apply px-8 py-3 border border-cyan-400 rounded-full text-white hover:bg-cyan-400 hover:bg-opacity-10 transition-all text-lg;
+}
+
+.btn-blue {
+  @apply px-6 py-2 bg-blue-500 rounded-full text-white hover:bg-blue-600 transition-all;
+}
+
+.card-dark {
+  @apply bg-slate-800 bg-opacity-50 border border-slate-700 rounded-2xl p-6;
+}
+
+.card-dark-lg {
+  @apply bg-slate-800 bg-opacity-50 border border-slate-700 rounded-3xl p-8;
+}

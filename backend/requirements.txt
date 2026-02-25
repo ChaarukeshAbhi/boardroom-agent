@@ -1,0 +1,23 @@
+# Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# AI/ML - Google Gemini
+google-generativeai==0.3.2
+
+# AI/ML - PyTorch (install BEFORE Whisper)
+torch==2.1.0
+torchaudio==2.1.0
+
+# AI/ML - Whisper (install from GitHub for stability)
+git+https://github.com/openai/whisper.git
+
+# Database - Supabase
+supabase==2.3.0
+
+# Utilities
+python-dotenv==1.0.0
+httpx==0.25.2
+pydantic==2.5.2
+pydantic-settings==2.1.0
