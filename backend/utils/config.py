@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     RECALL_API_KEY: str = ""
     RECALL_WEBHOOK_URL: str = ""
     ASSEMBLYAI_API_KEY: str = ""
+    HUGGINGFACE_TOKEN: str = ""
     # Supabase
     SUPABASE_URL: str = Field(..., env="SUPABASE_URL")
     SUPABASE_KEY: str = Field(..., env="SUPABASE_KEY")

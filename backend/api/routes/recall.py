@@ -8,6 +8,7 @@ router = APIRouter(prefix="/api/recall", tags=["Recall"])
 RECALL_API_KEY = settings.RECALL_API_KEY
 RECALL_BASE_URL = "https://ap-northeast-1.recall.ai"
 
+
 # ============ JOIN MEETING ============
 @router.post("/join")
 async def join_meeting(payload: dict):
@@ -63,7 +64,7 @@ async def join_meeting(payload: dict):
 # ============ GET BOT STATUS ============
 @router.get("/status/{bot_id}")
 async def get_bot_status(bot_id: str):
-    """Check bot recording status - FIXED"""
+    """Check bot recording status"""
     try:
         print(f"📊 Fetching status for bot: {bot_id}")
         
@@ -102,14 +103,79 @@ async def get_bot_status(bot_id: str):
         raise HTTPException(status_code=500, detail=f"Connection error: {str(e)}")
 
 
+# ============ EXTRACT PARTICIPANTS ============
+async def extract_participants_from_recall(recording: dict) -> dict:
+    """
+    Extract participant names and IDs from Recall.ai recording data
+    Returns: {0: "Chaarukesh", 1: "Balaji", 2: "John"}
+    """
+    participants_map = {}
+    
+    try:
+        # Try to get from media_shortcuts
+        media_shortcuts = recording.get("media_shortcuts", {}) or {}
+        
+        # Look for participant_events
+        participant_events = media_shortcuts.get("participant_events") or {}
+        if isinstance(participant_events, dict):
+            pe_data = participant_events.get("data", {})
+            participants_url = pe_data.get("participants_download_url")
+            
+            if participants_url:
+                print(f"📥 Downloading participants from: {participants_url}")
+                resp = requests.get(participants_url, timeout=10)
+                
+                if resp.ok:
+                    participants_list = resp.json()
+                    print(f"✅ Raw participants: {participants_list}")
+                    
+                    # Map participant ID to name
+                    if isinstance(participants_list, list):
+                        for idx, participant in enumerate(participants_list):
+                            if isinstance(participant, dict):
+                                name = (
+                                    participant.get("name") 
+                                    or participant.get("email", "").split("@")[0]
+                                    or participant.get("display_name")
+                                    or f"Speaker {idx + 1}"
+                                )
+                                participants_map[idx] = name
+                                print(f"   Participant {idx}: {name}")
+                    elif isinstance(participants_list, dict):
+                        # Handle if it's a dict
+                        for key, participant in participants_list.items():
+                            if isinstance(participant, dict):
+                                name = (
+                                    participant.get("name")
+                                    or participant.get("email", "").split("@")[0]
+                                    or participant.get("display_name")
+                                    or f"Speaker {key}"
+                                )
+                                try:
+                                    participants_map[int(key)] = name
+                                except:
+                                    participants_map[key] = name
+                                print(f"   Participant {key}: {name}")
+                else:
+                    print(f"⚠️ Failed to fetch participants: {resp.status_code}")
+        
+        if not participants_map:
+            print("⚠️ No participants found in media_shortcuts")
+            
+    except Exception as e:
+        print(f"⚠️ Error extracting participants: {e}")
+    
+    return participants_map
+
+
 # ============ GET TRANSCRIPT ============
 @router.get("/transcript/{bot_id}")
 async def get_transcript(bot_id: str):
-    """Get transcript after meeting ends"""
+    """Get transcript after meeting ends using AssemblyAI with Recall.ai participant names"""
     try:
         print(f"📥 Getting transcript for bot: {bot_id}")
         
-        # 1️⃣ Get bot status
+        # 1️⃣ Get bot status and data
         status_res = requests.get(
             f"{RECALL_BASE_URL}/api/v1/bot/{bot_id}/",
             headers={"Authorization": f"Token {RECALL_API_KEY}"}
@@ -120,33 +186,29 @@ async def get_transcript(bot_id: str):
 
         bot_data = status_res.json()
         print(f"✅ Bot data retrieved")
-        print(f"📄 Raw bot data: {bot_data}")
         
         # 2️⃣ Get recordings
         recordings = bot_data.get("recordings", [])
-        print(f"🎧 Recordings list: {recordings}")
         if not recordings:
             raise HTTPException(
                 status_code=404,
-                detail=f"No recordings found in Recall response. Bot status: {bot_data.get('status')}"
+                detail=f"No recordings found. Bot status: {bot_data.get('status')}"
             )
         
         recording = recordings[0]
-
-        # Prefer direct audio_url if Recall provides it
         audio_url = recording.get("audio_url")
 
-        # Fallbacks via media_shortcuts if needed
-        media_shortcuts = recording.get("media_shortcuts", {}) or {}
+        # Fallback: Try media_shortcuts for audio_mixed
         if not audio_url:
-            transcript_info = (
-                media_shortcuts.get("audio_mixed")
-                or media_shortcuts.get("transcript")
-            )
-            data = transcript_info.get("data") if isinstance(transcript_info, dict) else {}
-            audio_url = data.get("download_url")
+            media_shortcuts = recording.get("media_shortcuts", {}) or {}
+            audio_mixed = media_shortcuts.get("audio_mixed")
+            if isinstance(audio_mixed, dict):
+                audio_data = audio_mixed.get("data", {})
+                audio_url = audio_data.get("download_url")
 
+        # Fallback: Try media_shortcuts for video_mixed
         if not audio_url:
+            media_shortcuts = recording.get("media_shortcuts", {}) or {}
             video_mixed = media_shortcuts.get("video_mixed")
             if isinstance(video_mixed, dict):
                 video_data = video_mixed.get("data", {})
@@ -155,24 +217,28 @@ async def get_transcript(bot_id: str):
         if not audio_url:
             raise HTTPException(
                 status_code=404,
-                detail="Recording found but no downloadable audio/video URL for transcription"
+                detail="Recording found but no audio/video URL available"
             )
 
-        print(f"✅ Using audio URL for AssemblyAI: {audio_url}")
+        print(f"✅ Audio URL: {audio_url}")
 
-        # 3️⃣ Transcribe via AssemblyAI (handles speakers + text)
-        try:
-            assembly_result = transcribe_meeting_with_assembly(audio_url)
-        except Exception as e:
-            print(f"❌ AssemblyAI error: {e}")
-            raise HTTPException(status_code=500, detail=f"AssemblyAI error: {e}")
+        # 3️⃣ Extract participant names from Recall.ai
+        print(f"👥 Extracting participant names...")
+        participants_map = await extract_participants_from_recall(recording)
+        print(f"✅ Participant mapping: {participants_map}")
 
-        print(f"✅ AssemblyAI transcription complete! {assembly_result.get('segments_count', 0)} segments")
+        # 4️⃣ Transcribe with AssemblyAI
+        print(f"🎧 Transcribing with AssemblyAI...")
+        assembly_result = transcribe_meeting_with_assembly(audio_url, participants_map)
+
+        print(f"✅ Transcription complete! {assembly_result.get('segments_count', 0)} segments")
 
         return {
             "success": True,
             "bot_id": bot_id,
-            **assembly_result,
+            "language": assembly_result.get("language"),
+            "segments_count": assembly_result.get("segments_count"),
+            "transcript": assembly_result.get("transcript")
         }
 
     except HTTPException:
