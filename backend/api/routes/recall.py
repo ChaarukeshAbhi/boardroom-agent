@@ -1,9 +1,7 @@
 from fastapi import APIRouter, HTTPException
 import requests
-import os
-import tempfile
 from utils.config import settings
-from services.whisper_service import transcribe_with_segments
+from services.assembly_service import transcribe_meeting_with_assembly
 
 router = APIRouter(prefix="/api/recall", tags=["Recall"])
 
@@ -134,216 +132,47 @@ async def get_transcript(bot_id: str):
             )
         
         recording = recordings[0]
+
+        # Prefer direct audio_url if Recall provides it
         audio_url = recording.get("audio_url")
 
-        # ---- NEW: get participant + speaker timeline info for diarization ----
+        # Fallbacks via media_shortcuts if needed
         media_shortcuts = recording.get("media_shortcuts", {}) or {}
-        print(f"🔎 media_shortcuts: {media_shortcuts}")
-
-        participant_events = media_shortcuts.get("participant_events") or {}
-        pe_data = participant_events.get("data") if isinstance(participant_events, dict) else {}
-        participants_url = pe_data.get("participants_download_url")
-        speaker_timeline_url = pe_data.get("speaker_timeline_download_url")
-
-        participants_by_id = {}
-        speaker_timeline = []
-
-        try:
-            if participants_url:
-                resp = requests.get(participants_url)
-                if resp.ok:
-                    participants = resp.json()
-                    print(f"👥 Participants: {participants}")
-                    # Expect a list of participants with id + name/email
-                    for p in participants:
-                        pid = p.get("id")
-                        if pid is None:
-                            continue
-                        name = p.get("name") or p.get("email")
-                        if name:
-                            participants_by_id[pid] = name
-                else:
-                    print(f"⚠️ Failed to fetch participants: {resp.status_code}")
-
-            if speaker_timeline_url:
-                resp = requests.get(speaker_timeline_url)
-                if resp.ok:
-                    speaker_timeline = resp.json()
-                else:
-                    print(f"⚠️ Failed to fetch speaker timeline: {resp.status_code}")
-        except Exception as e:
-            # Don't fail transcript if diarization fetch fails
-            print(f"⚠️ Error fetching diarization data: {e}")
-
-        def infer_speaker_name(t: float) -> str:
-            """
-            Roughly map a segment start time to the most recent active speaker
-            using Recall's speaker_timeline + participants. Falls back to 'Unknown'.
-            """
-            if not speaker_timeline or not participants_by_id:
-                return "Unknown"
-
-            last_speaker_id = None
-            last_time = None
-
-            # Events are typically in time order, but sort to be safe
-            for ev in sorted(
-                speaker_timeline,
-                key=lambda e: e.get("timestamp", {}).get("relative", 0.0)
-            ):
-                ts = ev.get("timestamp", {})
-                rel = ts.get("relative")
-                if rel is None or rel > t:
-                    break
-
-                data = ev.get("data", ev)  # handle either flat or nested "data"
-                participant = data.get("participant", {})
-                pid = participant.get("id")
-                event_type = data.get("event") or ev.get("event")
-
-                if event_type and "speech_on" in event_type:
-                    last_speaker_id = pid
-                    last_time = rel
-                elif event_type and "speech_off" in event_type and pid == last_speaker_id:
-                    last_speaker_id = None
-
-            if last_speaker_id is not None:
-                return participants_by_id.get(last_speaker_id, f"Speaker {last_speaker_id}")
-
-            return "Unknown"
-
-        # ---- END diarization info fetch ----
-
         if not audio_url:
-            # Prefer an audio/transcript URL if present
             transcript_info = (
-                media_shortcuts.get("transcript") or
                 media_shortcuts.get("audio_mixed")
+                or media_shortcuts.get("transcript")
             )
-
             data = transcript_info.get("data") if isinstance(transcript_info, dict) else {}
             audio_url = data.get("download_url")
 
-            # Fallback: use the mixed video URL (Whisper can transcribe mp4)
-            if not audio_url:
-                video_mixed = media_shortcuts.get("video_mixed")
-                if isinstance(video_mixed, dict):
-                    video_data = video_mixed.get("data", {})
-                    audio_url = video_data.get("download_url")
+        if not audio_url:
+            video_mixed = media_shortcuts.get("video_mixed")
+            if isinstance(video_mixed, dict):
+                video_data = video_mixed.get("data", {})
+                audio_url = video_data.get("download_url")
 
         if not audio_url:
             raise HTTPException(
                 status_code=404,
-                detail="Recording found but no audio/transcript/video download URL in Recall response"
+                detail="Recording found but no downloadable audio/video URL for transcription"
             )
 
-        print(f"✅ Audio URL: {audio_url}")
+        print(f"✅ Using audio URL for AssemblyAI: {audio_url}")
 
-        # 3️⃣ Download audio
-        print(f"📥 Downloading audio...")
-        audio_response = requests.get(audio_url)
-        if not audio_response.ok:
-            raise HTTPException(status_code=500, detail="Failed to download audio")
+        # 3️⃣ Transcribe via AssemblyAI (handles speakers + text)
+        try:
+            assembly_result = transcribe_meeting_with_assembly(audio_url)
+        except Exception as e:
+            print(f"❌ AssemblyAI error: {e}")
+            raise HTTPException(status_code=500, detail=f"AssemblyAI error: {e}")
 
-        # Use a cross-platform temporary directory instead of hardcoded /tmp
-        temp_dir = tempfile.gettempdir()
-        audio_path = os.path.join(temp_dir, f"{bot_id}.wav")
-        with open(audio_path, "wb") as f:
-            f.write(audio_response.content)
-
-        print(f"✅ Audio saved at {audio_path}")
-
-        # 4️⃣ Transcribe with high-accuracy Whisper (see services/whisper_service + config)
-        print(f"🎧 Transcribing with Whisper...")
-        result = transcribe_with_segments(audio_path)
-
-        # 5️⃣ Format transcript - group by speaker into longer chunks
-        def format_timestamp(seconds: float) -> str:
-            """Format seconds as MM:SS or HH:MM:SS."""
-            total = int(seconds)
-            m, s = divmod(total, 60)
-            h, m = divmod(m, 60)
-            if h:
-                return f"{h:02d}:{m:02d}:{s:02d}"
-            return f"{m:02d}:{s:02d}"
-
-        # Group consecutive segments by (inferred) speaker
-        grouped_segments = []
-        current = None
-        speaker_order = {}
-        next_speaker_idx = 1
-
-        for seg in result["segments"]:
-            start_time = float(seg.get("start", 0.0))
-            end_time = float(seg.get("end", start_time))
-            text = seg.get("text", "").strip()
-            if not text:
-                continue
-
-            raw_speaker = infer_speaker_name(start_time)
-
-            # Assign stable Speaker N index per raw speaker label
-            key = raw_speaker or "Unknown"
-            if key not in speaker_order:
-                speaker_order[key] = next_speaker_idx
-                next_speaker_idx += 1
-            speaker_idx = speaker_order[key]
-
-            if raw_speaker and raw_speaker != "Unknown":
-                speaker_label = f"Speaker {speaker_idx} ({raw_speaker})"
-            else:
-                speaker_label = f"Speaker {speaker_idx}"
-
-            # Merge with previous block if same speaker and close in time
-            if (
-                current
-                and current["speaker"] == speaker_label
-                and start_time - current["end"] <= 2.0  # seconds gap threshold
-            ):
-                # Avoid obvious duplicated text (Whisper can sometimes repeat phrases)
-                combined = (current["text"] + " " + text).strip()
-                # If new text is almost fully contained at the end, skip appending
-                tail = current["text"][-len(text) - 5 :] if len(current["text"]) > len(text) + 5 else current["text"]
-                if text not in tail:
-                    current["text"] = combined
-                current["end"] = end_time
-            else:
-                if current:
-                    grouped_segments.append(current)
-                current = {
-                    "speaker": speaker_label,
-                    "text": text,
-                    "start": start_time,
-                    "end": end_time,
-                }
-
-        if current:
-            grouped_segments.append(current)
-
-        final_transcript = []
-        for block in grouped_segments:
-            final_transcript.append({
-                "speaker": block["speaker"],
-                "text": block["text"],
-                # Display only the starting timestamp of this speaker block
-                "timestamp": format_timestamp(block["start"]),
-                "start": block["start"],
-                "end": block["end"],
-            })
-
-        # 6️⃣ Cleanup
-        if os.path.exists(audio_path):
-            os.remove(audio_path)
-            print(f"✅ Cleaned up temp file")
-
-        print(f"✅ Transcription complete! {len(final_transcript)} segments")
+        print(f"✅ AssemblyAI transcription complete! {assembly_result.get('segments_count', 0)} segments")
 
         return {
             "success": True,
             "bot_id": bot_id,
-            "language": result.get("language"),
-            "segments_count": len(final_transcript),
-            "transcript": final_transcript
+            **assembly_result,
         }
 
     except HTTPException:

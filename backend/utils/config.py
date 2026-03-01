@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
     RECALL_API_KEY: str = ""
     RECALL_WEBHOOK_URL: str = ""
+    ASSEMBLYAI_API_KEY: str = ""
     # Supabase
     SUPABASE_URL: str = Field(..., env="SUPABASE_URL")
     SUPABASE_KEY: str = Field(..., env="SUPABASE_KEY")

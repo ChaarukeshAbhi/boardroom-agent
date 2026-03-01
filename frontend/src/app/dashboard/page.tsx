@@ -9,6 +9,7 @@ interface TranscriptLine {
   text: string;
   timestamp: string;
   confidence: number;
+  language?: string;
 }
 
 export default function DashboardPage() {
@@ -260,7 +261,10 @@ export default function DashboardPage() {
                     <div key={idx} className="bg-slate-900 bg-opacity-50 p-3 rounded-lg border border-slate-700">
                       <div className="flex items-start gap-3">
                         <div className="min-w-fit">
-                          <p className="text-cyan-400 font-semibold text-sm">{line.speaker}</p>
+                          <p className="text-cyan-400 font-semibold text-sm">
+                            {line.speaker}
+                            {line.language ? ` (${line.language})` : ""}
+                          </p>
                           <p className="text-slate-500 text-xs">{line.timestamp}</p>
                         </div>
                         <p className="text-slate-200 text-sm">{line.text}</p>

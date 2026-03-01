@@ -7,6 +7,7 @@ interface TranscriptEntry {
   speaker: string;
   text: string;
   timestamp: string;
+  language?: string;
 }
 
 interface TranscriptViewerProps {
@@ -59,6 +60,7 @@ export default function TranscriptViewer({
                 <div className="min-w-fit">
                   <span className="text-cyan-400 font-semibold text-sm block">
                     {entry.speaker}
+                    {entry.language ? ` (${entry.language})` : ""}
                   </span>
                   <div className="text-xs text-slate-500 mt-1">
                     {entry.timestamp}
