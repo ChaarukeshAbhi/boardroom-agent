@@ -1,9 +1,9 @@
 import time
 import requests
 from typing import Dict, Any
-from services.diarization_service import diarize_audio, match_utterance_to_speaker
 from utils.config import settings
-
+from difflib import SequenceMatcher
+from services.diarization_service import match_utterance_to_speaker
 
 ASSEMBLYAI_BASE_URL = "https://api.assemblyai.com/v2"
 
@@ -15,32 +15,36 @@ def _headers() -> Dict[str, str]:
     }
 
 
-def _format_timestamp(seconds: float) -> str:
-    total = int(seconds)
-    m, s = divmod(total, 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+def is_similar(a, b, threshold=0.85):
+    return SequenceMatcher(None, a, b).ratio() > threshold
 
 
-def transcribe_meeting_with_assembly(audio_url: str, participants_map: dict = None) -> Dict[str, Any]:
-    """
-    AssemblyAI transcription + Pyannote diarization
-    """
+def transcribe_meeting_with_assembly(
+    audio_url: str,
+    participants_map: dict,
+    speaker_segments: dict
+) -> Dict[str, Any]:
+
     if not settings.ASSEMBLYAI_API_KEY:
         raise RuntimeError("ASSEMBLYAI_API_KEY is not configured")
 
-    print(f"🎤 Starting transcription...")
+    print("🎤 Starting AssemblyAI transcription...")
+    print(f"📊 Participants map: {participants_map}")
 
-    # 1️⃣ Create transcript job (WITHOUT speaker_labels since we'll use Pyannote)
+    # ---------------------------------------------------
+    # 1️⃣ Create transcript job
+    # ---------------------------------------------------
     create_res = requests.post(
         f"{ASSEMBLYAI_BASE_URL}/transcript",
         json={
             "audio_url": audio_url,
+
+            # Recommended model for multilingual meetings
             "speech_models": ["universal-2"],
-            "speaker_labels": False,  # ✅ Disable AssemblyAI diarization
-            "language_detection": True,
+
+            # Speaker mapping handled using Pyannote
+            "speaker_labels": False,
+
             "punctuate": True,
             "format_text": True,
         },
@@ -52,20 +56,24 @@ def transcribe_meeting_with_assembly(audio_url: str, participants_map: dict = No
 
     job = create_res.json()
     transcript_id = job.get("id")
+
     if not transcript_id:
-        raise RuntimeError("AssemblyAI did not return a transcript id")
+        raise RuntimeError("AssemblyAI did not return transcript id")
 
     print(f"✅ Transcript job created: {transcript_id}")
 
+    # ---------------------------------------------------
     # 2️⃣ Poll until completed
-    poll_count = 0
+    # ---------------------------------------------------
     data = None
-    
+    poll_count = 0
+
     while True:
         res = requests.get(
             f"{ASSEMBLYAI_BASE_URL}/transcript/{transcript_id}",
             headers=_headers(),
         )
+
         if not res.ok:
             raise RuntimeError(f"AssemblyAI polling error: {res.text}")
 
@@ -73,8 +81,9 @@ def transcribe_meeting_with_assembly(audio_url: str, participants_map: dict = No
         status = data.get("status")
 
         if status == "completed":
-            print(f"✅ Transcription completed!")
+            print("✅ Transcription completed!")
             break
+
         if status == "error":
             raise RuntimeError(f"AssemblyAI failed: {data.get('error')}")
 
@@ -82,66 +91,110 @@ def transcribe_meeting_with_assembly(audio_url: str, participants_map: dict = No
         print(f"⏳ Processing ({poll_count*3}s): {status}")
         time.sleep(3)
 
-    # 3️⃣ Get speaker diarization using Pyannote
-    print("🎧 Running speaker diarization...")
-    speaker_segments = diarize_audio(audio_url)
+    # ---------------------------------------------------
+    # 3️⃣ Use WORD timestamps (IMPORTANT)
+    # ---------------------------------------------------
+    words = data.get("words", [])
 
-    # 4️⃣ Build transcript with correct speakers
-    utterances = data.get("utterances") or []
-    print(f"📝 Processing {len(utterances)} utterances...")
+    if not words:
+        print("⚠️ No word timestamps returned")
+        return {
+            "language": data.get("language_code"),
+            "segments_count": 0,
+            "transcript": []
+        }
 
-    language = data.get("language_code")
-    if not language:
-        lang_det = data.get("language_detection") or []
-        if isinstance(lang_det, list) and lang_det:
-            language = lang_det[0].get("language")
+    print(f"📝 Using words: {len(words)}")
 
-    print(f"🌍 Language: {language}")
+    # ---------------------------------------------------
+    # 4️⃣ Merge using diarization timestamps
+    # ---------------------------------------------------
+    speaker_blocks = []
+    current_block = []
+    current_speaker = None
+    last_text = ""
 
-    final_transcript = []
-    speaker_seen = set()
-    last_speaker = None
-    current_block = None
+    BLOCK_TIME_WINDOW = 8   # seconds
+    block_start_time = None
 
-    for utt in utterances:
-        text = (utt.get("text") or "").strip()
+    for word in words:
+
+        start = word["start"] / 1000
+        end = word["end"] / 1000
+        text = (word.get("text") or "").strip()
+
         if not text:
             continue
 
-        # Get timing
-        start_time = utt.get("start", 0) / 1000.0  # Convert ms to seconds
-        end_time = utt.get("end", start_time) / 1000.0
+        # -----------------------------------------------
+        # Remove repetition loops
+        # -----------------------------------------------
+        if is_similar(text, last_text):
+            continue
 
-        # Match to speaker using Pyannote diarization
-        speaker_id = match_utterance_to_speaker(start_time, end_time, speaker_segments)
-        
-        # Get speaker name
-        if participants_map and speaker_id in participants_map:
-            speaker_name = participants_map[speaker_id]
-        else:
-            speaker_name = f"Speaker {chr(65 + speaker_id)}"
+        last_text = text
 
-        # Group consecutive same-speaker utterances
-        if speaker_name == last_speaker and current_block:
-            current_block["text"] += " " + text
-        else:
+        # -----------------------------------------------
+        # Match speaker using diarization timestamps
+        # -----------------------------------------------
+        speaker_id = match_utterance_to_speaker(
+            start,
+            end,
+            speaker_segments
+        )
+
+        if current_speaker is None:
+            current_speaker = speaker_id
+            block_start_time = start
+
+        # -----------------------------------------------
+        # Split block when:
+        # speaker changes OR time window exceeded
+        # -----------------------------------------------
+        if (
+            speaker_id != current_speaker
+            or (start - block_start_time) > BLOCK_TIME_WINDOW
+        ):
             if current_block:
-                final_transcript.append(current_block)
-            
-            current_block = {
-                "speaker": speaker_name,
-                "text": text,
-            }
-            last_speaker = speaker_name
-            
-            if speaker_name not in speaker_seen:
-                print(f"🗣️ Speaker: {speaker_name}")
-                speaker_seen.add(speaker_name)
+                speaker_blocks.append({
+                    "speaker": current_speaker,
+                    "text": " ".join(current_block)
+                })
+
+            current_block = []
+            current_speaker = speaker_id
+            block_start_time = start
+
+        current_block.append(text)
 
     if current_block:
-        final_transcript.append(current_block)
+        speaker_blocks.append({
+            "speaker": current_speaker,
+            "text": " ".join(current_block)
+        })
 
-    print(f"✅ Built transcript with {len(speaker_seen)} speakers")
+    # ---------------------------------------------------
+    # 5️⃣ Map speaker IDs → participant names
+    # ---------------------------------------------------
+    final_transcript = []
+
+    for block in speaker_blocks:
+        speaker_id = block["speaker"]
+
+        speaker_name = participants_map.get(
+            speaker_id,
+            f"Speaker {speaker_id+1}"
+        )
+
+        final_transcript.append({
+            "speaker": speaker_name,
+            "text": block["text"]
+        })
+
+    language = data.get("language_code")
+
+    print(f"🌍 Detected language: {language}")
+    print(f"✅ Built {len(final_transcript)} transcript blocks")
 
     return {
         "language": language,
