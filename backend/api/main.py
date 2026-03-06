@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from api.routes import meetings, health, auth, recall
 from api.ws import transcript
 from api.routes import recall_audio
+from api.routes import archive
 
 app = FastAPI(
     title="BoardRoom Agent API",
@@ -23,6 +24,7 @@ app.include_router(meetings.router)
 app.include_router(recall.router)   
 app.include_router(transcript.router)
 app.include_router(recall_audio.router)
+app.include_router(archive.router)
 
 @app.get("/")
 async def root():

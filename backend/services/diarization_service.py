@@ -58,7 +58,7 @@ def diarize_audio(audio_url: str) -> dict:
 
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            token=settings.HUGGINGFACE_TOKEN
+            use_auth_token=settings.HUGGINGFACE_TOKEN
         )
 
         # Optional GPU acceleration (if available)

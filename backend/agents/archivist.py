@@ -1,114 +1,188 @@
+# agents/archivist.py
+
+import os
+from supabase import create_client
 import google.generativeai as genai
 from utils.config import settings
-from utils.database import supabase
-from typing import Dict, Any
+from typing import List, Dict
+
+# ==============================
+# Environment Variables
+# ==============================
+
+SUPABASE_URL = settings.SUPABASE_URL
+SUPABASE_KEY = settings.SUPABASE_KEY
+GEMINI_API_KEY = settings.GEMINI_API_KEY
+
+# ==============================
+# Initialize Clients
+# ==============================
+
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
+
+
+# ==============================
+# Archivist Agent
+# ==============================
 
 class ArchivistAgent:
-    """
-    Archivist Agent: Generates summaries using Google Gemini
-    """
-    
+
     def __init__(self):
-        # Configure Gemini
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-pro')
-        print("✅ Gemini AI configured!")
-    
-    def generate_summary(self, transcript: str, language: str) -> str:
-        """
-        Generate meeting summary using Gemini
-        
-        Args:
-            transcript: Full meeting transcript
-            language: Detected language
-            
-        Returns:
-            Summary text
-        """
-        print("📝 Generating summary with Gemini AI...")
-        
-        prompt = f"""You are analyzing a meeting transcript.
+        self.table_name = "transcripts"
 
-Language detected: {language}
+    # ==========================================
+    # STORE TRANSCRIPT (One row per segment)
+    # ==========================================
+    def store_transcript(self, meeting_id: str, transcript: List[Dict]):
 
-Transcript:
-{transcript}
+        rows = []
 
-Generate a concise, professional summary with these sections:
-
-**Main Topics Discussed:**
-- List 2-3 key topics (bullet points)
-
-**Key Decisions Made:**
-- List important decisions (if any)
-
-**Action Items:**
-- List tasks with owners (if mentioned)
-
-**Overall Sentiment:**
-- Rate as: Positive / Neutral / Negative / Mixed
-
-Keep the summary under 300 words and make it actionable for business context."""
-
-        try:
-            response = self.model.generate_content(prompt)
-            summary = response.text
-            print("✅ Summary generated!")
-            return summary
-            
-        except Exception as e:
-            print(f"❌ Gemini error: {str(e)}")
-            # Fallback summary
-            return f"""**Meeting Summary**
-
-**Language:** {language}
-
-**Transcript Preview:**
-{transcript[:500]}...
-
-*Note: Full AI summary generation encountered an error. Please review the transcript above.*"""
-    
-    def store_meeting(self, meeting_data: Dict[str, Any]) -> str:
-        """
-        Store meeting in Supabase
-        
-        Args:
-            meeting_data: Dictionary with meeting information
-            
-        Returns:
-            Meeting ID
-        """
-        print("💾 Storing meeting in database...")
-        
-        try:
-            # Insert meeting
-            meeting_response = supabase.table("meetings").insert({
-                "title": meeting_data["title"],
-                "meeting_url": meeting_data.get("meeting_url", ""),
-                "status": "completed",
-                "duration_minutes": int(meeting_data.get("duration", 0) / 60)
-            }).execute()
-            
-            meeting_id = meeting_response.data[0]["id"]
-            
-            # Store transcript
-            supabase.table("transcripts").insert({
+        for segment in transcript:
+            row = {
                 "meeting_id": meeting_id,
-                "full_text": meeting_data["transcript"],
-                "language": meeting_data["language"]
-            }).execute()
-            
-            # Store summary
-            supabase.table("summaries").insert({
-                "meeting_id": meeting_id,
-                "summary_type": "general",
-                "content": meeting_data["summary"]
-            }).execute()
-            
-            print(f"✅ Meeting stored! ID: {meeting_id}")
-            
-            return meeting_id
-            
-        except Exception as e:
-            print(f"❌ Database error: {str(e)}")
-            raise
+                "speaker": segment.get("speaker"),
+                "text": segment.get("text"),
+                "timestamp": segment.get("timestamp"),
+                "confidence": segment.get("confidence"),
+                "language": segment.get("language")
+            }
+
+            rows.append(row)
+
+        supabase.table(self.table_name).insert(rows).execute()
+
+        return {"status": "stored", "segments": len(rows)}
+
+    # ==========================================
+    # GET MEETING TRANSCRIPT
+    # ==========================================
+    def get_meeting_transcript(self, meeting_id: str):
+
+        response = supabase.table(self.table_name)\
+            .select("*")\
+            .eq("meeting_id", meeting_id)\
+            .order("timestamp")\
+            .execute()
+
+        return response.data
+
+    # ==========================================
+    # GET MEETING HISTORY
+    # ==========================================
+    def get_meeting_history(self):
+
+        response = supabase.table(self.table_name)\
+            .select("meeting_id")\
+            .execute()
+
+        meetings = list(set([row["meeting_id"] for row in response.data]))
+
+        return meetings
+
+    # ==========================================
+    # BUILD CONTEXT FOR RAG
+    # ==========================================
+    def build_context(self, segments):
+
+        context = ""
+
+        for s in segments:
+            speaker = s["speaker"]
+            text = s["text"]
+
+            context += f"{speaker}: {text}\n"
+
+        return context
+
+    # ==========================================
+    # GENERATE SUMMARY (RAG)
+    # ==========================================
+    def generate_summary(self, meeting_id: str):
+
+        segments = self.get_meeting_transcript(meeting_id)
+
+        if not segments:
+            return {"summary": "No transcript found."}
+
+        context = self.build_context(segments)
+
+        prompt = f"""
+        You are a meeting intelligence assistant.
+
+        Summarize the following meeting transcript clearly.
+
+        Transcript:
+        {context}
+
+        Provide:
+        - Key discussion points
+        - Important decisions
+        - Action items
+        """
+
+        response = model.generate_content(prompt)
+
+        return {
+            "meeting_id": meeting_id,
+            "summary": response.text
+        }
+
+    # ==========================================
+    # ASK AI ABOUT MEETING
+    # ==========================================
+    def ask_meeting(self, meeting_id: str, question: str):
+
+        segments = self.get_meeting_transcript(meeting_id)
+
+        context = self.build_context(segments)
+
+        prompt = f"""
+        Answer the question using the meeting transcript.
+
+        Transcript:
+        {context}
+
+        Question:
+        {question}
+        """
+
+        response = model.generate_content(prompt)
+
+        return {"answer": response.text}
+
+    # ==========================================
+    # COMPARE TWO MEETINGS
+    # ==========================================
+    def compare_meetings(self, meeting1: str, meeting2: str):
+
+        seg1 = self.get_meeting_transcript(meeting1)
+        seg2 = self.get_meeting_transcript(meeting2)
+
+        context1 = self.build_context(seg1)
+        context2 = self.build_context(seg2)
+
+        prompt = f"""
+        Compare the following two meetings.
+
+        Meeting 1:
+        {context1}
+
+        Meeting 2:
+        {context2}
+
+        Provide:
+        - Differences
+        - Similar discussion topics
+        - New decisions in Meeting 2
+        """
+
+        response = model.generate_content(prompt)
+
+        return {
+            "meeting1": meeting1,
+            "meeting2": meeting2,
+            "comparison": response.text
+        }
